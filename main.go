@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,13 +17,16 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/text"
+	"github.com/mb-14/gomarkov"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 )
 
 const (
-	screenWidth  = 800
-	screenHeight = 600
+	screenWidth  = 460  // Outer ring radius (200) * 2 + padding for characters
+	screenHeight = 460
+	trainingDataFile = "markov_training.json"
+	rawTextFile = "typed_text.txt"
 )
 
 type Game struct {
@@ -42,11 +48,325 @@ type Game struct {
 	// Visibility state
 	lastInputTime time.Time
 	opacity       float64
+	isVisible     bool
+	
+	// Window position
+	windowX float64
+	windowY float64
+	windowInitialized bool
+	
+	// Markov chain for word prediction
+	markovChain    *gomarkov.Chain
+	currentSentence []string
+	recentWords     []string  // Track recent words for training
+	trainingData    [][]string // All training sentences
+	nextPrediction  string     // Current word prediction to display
+	wordFrequency   map[string]int // Track word frequencies for autocomplete
+}
+
+// saveTrainingData saves all training sentences to a file
+func (g *Game) saveTrainingData() error {
+	// Get user's home directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	
+	configDir := filepath.Join(homeDir, ".config", "control")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return err
+	}
+	
+	filePath := filepath.Join(configDir, trainingDataFile)
+	data, err := json.Marshal(g.trainingData)
+	if err != nil {
+		return err
+	}
+	
+	return os.WriteFile(filePath, data, 0644)
+}
+
+// loadTrainingData loads training sentences from file
+func (g *Game) loadTrainingData() error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	
+	filePath := filepath.Join(homeDir, ".config", "control", trainingDataFile)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File doesn't exist yet, that's ok
+			g.trainingData = [][]string{}
+			return nil
+		}
+		return err
+	}
+	
+	return json.Unmarshal(data, &g.trainingData)
+}
+
+// appendToRawText appends text to the raw text file
+func (g *Game) appendToRawText(text string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	
+	configDir := filepath.Join(homeDir, ".config", "control")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return err
+	}
+	
+	filePath := filepath.Join(configDir, rawTextFile)
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	
+	_, err = f.WriteString(text)
+	return err
+}
+
+// loadRawTextAndTrain loads all previously typed text and trains the Markov chain
+func (g *Game) loadRawTextAndTrain() error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	
+	filePath := filepath.Join(homeDir, ".config", "control", rawTextFile)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File doesn't exist yet, that's ok
+			return nil
+		}
+		return err
+	}
+	
+	// Parse the text into sentences and words
+	text := string(data)
+	if text == "" {
+		return nil
+	}
+	
+	// Split by common sentence endings
+	sentences := strings.FieldsFunc(text, func(r rune) bool {
+		return r == '.' || r == '!' || r == '?' || r == '\n'
+	})
+	
+	// Process each sentence
+	for _, sentence := range sentences {
+		// Clean and split into words
+		sentence = strings.TrimSpace(sentence)
+		if sentence == "" {
+			continue
+		}
+		
+		// Split into words
+		words := strings.Fields(sentence)
+		if len(words) > 1 {
+			// Clean each word (remove punctuation except apostrophes)
+			cleanWords := make([]string, 0, len(words))
+			for _, word := range words {
+				// Remove trailing punctuation
+				word = strings.TrimRight(word, ",.;:\"'!?")
+				// Remove leading punctuation
+				word = strings.TrimLeft(word, "\"'")
+				if word != "" {
+					cleanWords = append(cleanWords, strings.ToLower(word))
+				}
+			}
+			
+			if len(cleanWords) > 1 {
+				g.markovChain.Add(cleanWords)
+			}
+			
+			// Add words to frequency map
+			for _, word := range cleanWords {
+				g.wordFrequency[word]++
+			}
+		}
+	}
+	
+	log.Printf("Loaded and trained on raw text file (%d bytes)", len(data))
+	return nil
+}
+
+// updatePrediction generates the next word prediction based on current context
+func (g *Game) updatePrediction() {
+	if g.markovChain == nil {
+		g.nextPrediction = ""
+		log.Printf("No prediction: markovChain is nil")
+		return
+	}
+	
+	// If no sentence started yet, try to predict from empty context
+	if len(g.currentSentence) == 0 {
+		// Try to generate a starting word
+		next, err := g.markovChain.Generate([]string{""})
+		if err == nil && next != "" {
+			g.nextPrediction = next
+			log.Printf("Initial prediction: '%s'", next)
+		} else {
+			g.nextPrediction = ""
+			log.Printf("No initial prediction available")
+		}
+		return
+	}
+	
+	// Check if we have a partial word being typed
+	currentWord := g.currentSentence[len(g.currentSentence)-1]
+	
+	// Use the appropriate context
+	var contextWord string
+	var isPartialWord bool
+	
+	
+	if currentWord == "" && len(g.currentSentence) > 1 {
+		// Just typed space, use previous complete word
+		contextWord = g.currentSentence[len(g.currentSentence)-2]
+		isPartialWord = false
+	} else if currentWord != "" {
+		// We have a partial or complete word
+		if len(g.currentSentence) > 1 {
+			// Use previous word as context for prediction
+			contextWord = g.currentSentence[len(g.currentSentence)-2]
+		} else {
+			// First word, try to predict based on partial
+			contextWord = currentWord
+		}
+		isPartialWord = true
+	}
+	
+	if contextWord != "" || isPartialWord {
+		if !isPartialWord || len(g.currentSentence) > 1 {
+			// Generate next word prediction based on previous word
+			next, err := g.markovChain.Generate([]string{contextWord})
+			if err == nil && next != "" {
+				g.nextPrediction = next
+				log.Printf("Prediction updated: context='%s' -> prediction='%s'", contextWord, next)
+			} else {
+				// If the exact word isn't known, try common follow-ups
+				log.Printf("No prediction for '%s', trying fallbacks", contextWord)
+				
+				// Try to find any word that commonly follows short words
+				if len(contextWord) <= 3 {
+					// For short words, try common patterns
+					commonFollowUps := []string{"the", "a", "is", "are", "and", "to", "in", "it", "that", "of"}
+					if len(commonFollowUps) > 0 {
+						// Pick a common word
+						g.nextPrediction = commonFollowUps[0]
+						log.Printf("Using fallback prediction: '%s'", g.nextPrediction)
+					} else {
+						g.nextPrediction = ""
+					}
+				} else {
+					// For longer unknown words, suggest common next words
+					g.nextPrediction = "the"
+					log.Printf("Using default prediction: '%s'", g.nextPrediction)
+				}
+			}
+		} else if isPartialWord && currentWord != "" {
+			// Autocomplete based on word frequency
+			lowerCurrent := strings.ToLower(currentWord)
+			var bestMatch string
+			maxFrequency := 0
+			
+			// Search for words that start with the current partial word
+			for word, freq := range g.wordFrequency {
+				if strings.HasPrefix(word, lowerCurrent) && word != lowerCurrent {
+					if freq > maxFrequency {
+						maxFrequency = freq
+						bestMatch = word
+					}
+				}
+			}
+			
+			if bestMatch != "" {
+				g.nextPrediction = bestMatch
+				log.Printf("Autocompleting '%s' to '%s' (frequency: %d)", currentWord, bestMatch, maxFrequency)
+			} else {
+				// No completion found in training data
+				g.nextPrediction = ""
+				log.Printf("No autocomplete found for '%s'", currentWord)
+			}
+		}
+	} else {
+		g.nextPrediction = ""
+		log.Printf("No context word available")
+	}
 }
 
 func (g *Game) Update() error {
 	if g.gamepadIDs == nil {
 		g.gamepadIDs = map[ebiten.GamepadID]struct{}{}
+	}
+	
+	// Initialize window position on first frame
+	if !g.windowInitialized {
+		ebiten.SetWindowPosition(int(g.windowX), int(g.windowY))
+		g.windowInitialized = true
+	}
+	
+	// Initialize Markov chain
+	if g.markovChain == nil {
+		g.markovChain = gomarkov.NewChain(1) // Order 1 chain (uses 1 previous word)
+		g.wordFrequency = make(map[string]int)
+		
+		// Load training data from file
+		if err := g.loadTrainingData(); err != nil {
+			log.Printf("Error loading training data: %v", err)
+		}
+		
+		// If no training data exists, start with some common phrases
+		if len(g.trainingData) == 0 {
+			g.trainingData = [][]string{
+				{"hello", "world"},
+				{"how", "are", "you"},
+				{"the", "quick", "brown", "fox"},
+				{"I", "am", "fine"},
+				{"thank", "you", "very", "much"},
+				{"what", "is", "your", "name"},
+				{"nice", "to", "meet", "you"},
+				{"have", "a", "good", "day"},
+				{"see", "you", "later"},
+				{"good", "morning"},
+				{"good", "afternoon"},
+				{"good", "evening"},
+				{"ok", "thanks"},
+				{"ok", "I", "will"},
+				{"ok", "let", "me", "check"},
+				{"ok", "sounds", "good"},
+				{"yes", "I", "agree"},
+				{"no", "thank", "you"},
+				{"please", "help", "me"},
+				{"can", "you", "help"},
+				{"this", "is", "great"},
+				{"that", "is", "awesome"},
+			}
+		}
+		
+		// Train the chain with all saved data
+		for _, sentence := range g.trainingData {
+			g.markovChain.Add(sentence)
+			// Add to word frequency
+			for _, word := range sentence {
+				g.wordFrequency[strings.ToLower(word)]++
+			}
+		}
+		log.Printf("Loaded %d training sentences", len(g.trainingData))
+		
+		// Load and train on all previously typed text
+		if err := g.loadRawTextAndTrain(); err != nil {
+			log.Printf("Error loading raw text: %v", err)
+		}
+		
+		// Generate initial prediction
+		g.updatePrediction()
 	}
 
 	// Initialize ring keyboard with 2 rings and 2 sets
@@ -92,9 +412,6 @@ func (g *Game) Update() error {
 		}
 	}
 
-	// Track if there's any gamepad input
-	hasInput := false
-	
 	g.axes = map[ebiten.GamepadID][]string{}
 	g.pressedButtons = map[ebiten.GamepadID][]string{}
 	for id := range g.gamepadIDs {
@@ -164,16 +481,15 @@ func (g *Game) Update() error {
 			
 			// Detect joystick movement
 			if magnitude > 0.1 {
-				hasInput = true
 				g.lastInputTime = time.Now()
 			}
 
 			// Determine which ring based on magnitude
 			if magnitude > 0.1 {
-				if magnitude < 0.95 {
-					g.selectedRing = 0 // Inner ring (95% of range)
+				if magnitude < 0.9 {
+					g.selectedRing = 0 // Inner ring (90% of range)
 				} else {
-					g.selectedRing = 1 // Outer ring (last 5%)
+					g.selectedRing = 1 // Outer ring (last 10%)
 				}
 
 				// Calculate angle from joystick position
@@ -193,7 +509,6 @@ func (g *Game) Update() error {
 			// Check for any button press
 			for b := ebiten.StandardGamepadButton(0); b <= ebiten.StandardGamepadButtonMax; b++ {
 				if ebiten.IsStandardGamepadButtonPressed(id, b) {
-					hasInput = true
 					g.lastInputTime = time.Now()
 					break
 				}
@@ -211,19 +526,64 @@ func (g *Game) Update() error {
 							selectedChar := currentRing[g.selectedIndex]
 							if selectedChar == "⌫" { // Backspace
 								robotgo.KeyTap("backspace")
+								// Remove last character from current word
+								if len(g.currentSentence) > 0 {
+									lastWord := g.currentSentence[len(g.currentSentence)-1]
+									if len(lastWord) > 0 {
+										g.currentSentence[len(g.currentSentence)-1] = lastWord[:len(lastWord)-1]
+										if g.currentSentence[len(g.currentSentence)-1] == "" {
+											g.currentSentence = g.currentSentence[:len(g.currentSentence)-1]
+										}
+									}
+								}
+								g.updatePrediction()
 							} else if selectedChar == "↵" { // Enter
 								robotgo.KeyTap("enter")
+								// Save newline to raw text
+								if err := g.appendToRawText("\n"); err != nil {
+									log.Printf("Error saving newline: %v", err)
+								}
+								// Train markov chain with current sentence if it has words
+								if len(g.currentSentence) > 1 {
+									g.markovChain.Add(g.currentSentence)
+									g.trainingData = append(g.trainingData, append([]string{}, g.currentSentence...))
+									// Update word frequency
+									for _, word := range g.currentSentence {
+										if word != "" {
+											g.wordFrequency[strings.ToLower(word)]++
+										}
+									}
+									if err := g.saveTrainingData(); err != nil {
+										log.Printf("Error saving training data: %v", err)
+									}
+								}
+								g.currentSentence = []string{}
 							} else {
 								// Apply uppercase/lowercase transformation for letters
+								outputChar := selectedChar
 								if len(selectedChar) == 1 && selectedChar >= "A" && selectedChar <= "Z" {
 									if g.uppercase {
 										robotgo.TypeStr(selectedChar)
 									} else {
-										robotgo.TypeStr(strings.ToLower(selectedChar))
+										outputChar = strings.ToLower(selectedChar)
+										robotgo.TypeStr(outputChar)
 									}
 								} else {
 									robotgo.TypeStr(selectedChar)
 								}
+								
+								// Save typed character to raw text file
+								if err := g.appendToRawText(outputChar); err != nil {
+									log.Printf("Error saving typed text: %v", err)
+								}
+								
+								// Track the character for word building
+								if len(g.currentSentence) == 0 {
+									g.currentSentence = []string{""}
+								}
+								g.currentSentence[len(g.currentSentence)-1] += outputChar
+								log.Printf("Added char '%s' to word. Current sentence: %v", outputChar, g.currentSentence)
+								g.updatePrediction()
 							}
 							g.lastButtonTime = now
 						}
@@ -235,16 +595,59 @@ func (g *Game) Update() error {
 			// Delete one character with B button (RightRight)
 			if inpututil.IsStandardGamepadButtonJustPressed(id, ebiten.StandardGamepadButtonRightRight) {
 				robotgo.KeyTap("backspace")
+				// Handle backspace for word tracking
+				if len(g.currentSentence) > 0 {
+					lastWord := g.currentSentence[len(g.currentSentence)-1]
+					if len(lastWord) > 0 {
+						g.currentSentence[len(g.currentSentence)-1] = lastWord[:len(lastWord)-1]
+						if g.currentSentence[len(g.currentSentence)-1] == "" {
+							g.currentSentence = g.currentSentence[:len(g.currentSentence)-1]
+						}
+					}
+				}
+				g.updatePrediction()
 			}
 
 			// Add space with X button (RightLeft)
 			if inpututil.IsStandardGamepadButtonJustPressed(id, ebiten.StandardGamepadButtonRightLeft) {
 				robotgo.TypeStr(" ")
+				// Save space to raw text
+				if err := g.appendToRawText(" "); err != nil {
+					log.Printf("Error saving space: %v", err)
+				}
+				// Start a new word
+				if len(g.currentSentence) > 0 && g.currentSentence[len(g.currentSentence)-1] != "" {
+					g.currentSentence = append(g.currentSentence, "")
+					log.Printf("Space pressed - new word started. Sentence: %v", g.currentSentence)
+				} else if len(g.currentSentence) == 0 {
+					// Start with empty word if no sentence yet
+					g.currentSentence = []string{""}
+				}
+				g.updatePrediction()
 			}
 			
 			// Add new line with Y button (RightTop)
 			if inpututil.IsStandardGamepadButtonJustPressed(id, ebiten.StandardGamepadButtonRightTop) {
 				robotgo.KeyTap("enter")
+				// Save newline to raw text
+				if err := g.appendToRawText("\n"); err != nil {
+					log.Printf("Error saving newline: %v", err)
+				}
+				// Train markov chain with current sentence if it has words
+				if len(g.currentSentence) > 1 {
+					g.markovChain.Add(g.currentSentence)
+					g.trainingData = append(g.trainingData, append([]string{}, g.currentSentence...))
+					// Update word frequency
+					for _, word := range g.currentSentence {
+						if word != "" {
+							g.wordFrequency[strings.ToLower(word)]++
+						}
+					}
+					if err := g.saveTrainingData(); err != nil {
+						log.Printf("Error saving training data: %v", err)
+					}
+				}
+				g.currentSentence = []string{}
 			}
 			
 			// D-pad arrow key mapping
@@ -274,14 +677,110 @@ func (g *Game) Update() error {
 			} else {
 				g.uppercase = false // Lowercase when released
 			}
+			
+			// R2/button 7 for accepting word prediction
+			if inpututil.IsStandardGamepadButtonJustPressed(id, ebiten.StandardGamepadButton(7)) {
+				log.Printf("R2 (button 7) pressed, prediction: '%s'", g.nextPrediction)
+				if g.nextPrediction != "" {
+					// Determine what to type based on current word state
+					var toType string
+					var currentWord string
+					
+					if len(g.currentSentence) > 0 && g.currentSentence[len(g.currentSentence)-1] != "" {
+						// We have a partial word - only type the completion
+						currentWord = g.currentSentence[len(g.currentSentence)-1]
+						if strings.HasPrefix(strings.ToLower(g.nextPrediction), strings.ToLower(currentWord)) {
+							// Prediction starts with current word, type only the rest
+							toType = g.nextPrediction[len(currentWord):] + " "
+						} else {
+							// Prediction doesn't match, replace the whole word
+							// First delete the current partial word
+							for i := 0; i < len(currentWord); i++ {
+								robotgo.KeyTap("backspace")
+							}
+							toType = g.nextPrediction + " "
+						}
+					} else {
+						// No partial word, type the whole prediction
+						toType = g.nextPrediction + " "
+					}
+					
+					// Type the completion
+					robotgo.TypeStr(toType)
+					
+					// Save what was actually typed to raw text
+					if err := g.appendToRawText(toType); err != nil {
+						log.Printf("Error saving predicted word: %v", err)
+					}
+					
+					// Update sentence tracking with the complete word
+					if len(g.currentSentence) == 0 {
+						g.currentSentence = []string{g.nextPrediction, ""}
+					} else if g.currentSentence[len(g.currentSentence)-1] == "" {
+						g.currentSentence[len(g.currentSentence)-1] = g.nextPrediction
+						g.currentSentence = append(g.currentSentence, "")
+					} else {
+						// Update with the complete word
+						g.currentSentence[len(g.currentSentence)-1] = g.nextPrediction
+						g.currentSentence = append(g.currentSentence, "")
+					}
+					log.Printf("After prediction applied. Sentence: %v", g.currentSentence)
+					g.updatePrediction()
+				}
+			}
+			
+			// Handle right joystick for window movement
+			rightX := ebiten.StandardGamepadAxisValue(id, ebiten.StandardGamepadAxisRightStickHorizontal)
+			rightY := ebiten.StandardGamepadAxisValue(id, ebiten.StandardGamepadAxisRightStickVertical)
+			
+			// Apply dead zone
+			if math.Abs(rightX) > 0.1 || math.Abs(rightY) > 0.1 {
+				// Movement speed in pixels per frame
+				moveSpeed := 25.0
+				
+				// Calculate new position
+				newX := g.windowX + rightX * moveSpeed
+				newY := g.windowY + rightY * moveSpeed
+				
+				// Get monitor bounds (we'll use the monitor work area)
+				monitorX, monitorY := ebiten.Monitor().Size()
+				
+				// Clamp to screen boundaries
+				if newX < 0 {
+					newX = 0
+				}
+				if newY < 0 {
+					newY = 0
+				}
+				if newX > float64(monitorX - screenWidth) {
+					newX = float64(monitorX - screenWidth)
+				}
+				if newY > float64(monitorY - screenHeight) {
+					newY = float64(monitorY - screenHeight)
+				}
+				
+				// Update window position
+				g.windowX = newX
+				g.windowY = newY
+				ebiten.SetWindowPosition(int(g.windowX), int(g.windowY))
+				
+				// Mark as having input
+				g.lastInputTime = time.Now()
+			}
+			
+			// Button 9 to toggle visibility
+			if inpututil.IsGamepadButtonJustPressed(id, ebiten.GamepadButton(9)) {
+				g.isVisible = !g.isVisible
+				log.Printf("Visibility toggled: %v", g.isVisible)
+			}
 		}
 	}
 	
-	// Update opacity based on input activity
-	if hasInput {
-		g.opacity = 1.0 // Full opacity when there's input
+	// Update opacity based on visibility toggle
+	if g.isVisible {
+		g.opacity = 1.0
 	} else {
-		g.opacity = 0.0 // Immediately invisible when no input
+		g.opacity = 0.0
 	}
 	
 	return nil
@@ -372,7 +871,29 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			}
 		}
 
-
+		// Draw predicted word in the center
+		if g.nextPrediction != "" {
+			// Create a background for better visibility
+			bgColor := g.applyOpacity(color.RGBA{40, 40, 40, 200})
+			predBounds := text.BoundString(g.font, g.nextPrediction)
+			padding := 10
+			bgX := int(centerX) - predBounds.Dx()/2 - padding
+			bgY := int(centerY) - predBounds.Dy()/2 - padding
+			bgW := predBounds.Dx() + padding*2
+			bgH := predBounds.Dy() + padding*2
+			
+			// Draw background rectangle
+			for y := bgY; y < bgY+bgH; y++ {
+				for x := bgX; x < bgX+bgW; x++ {
+					screen.Set(x, y, bgColor)
+				}
+			}
+			
+			// Draw the predicted word
+			predX := int(centerX) - predBounds.Dx()/2
+			predY := int(centerY) + predBounds.Dy()/2
+			text.Draw(screen, g.nextPrediction, g.font, predX, predY, g.applyOpacity(color.RGBA{0, 255, 0, 255}))
+		}
 
 	} else {
 		str := "Please connect your gamepad."
@@ -392,7 +913,15 @@ func main() {
 	ebiten.SetScreenTransparent(true)
 	ebiten.SetWindowFloating(true)
 	ebiten.SetWindowMousePassthrough(true)
-	if err := ebiten.RunGame(&Game{}); err != nil {
+	
+	// Initialize game with center screen position
+	game := &Game{
+		windowX: 100.0,  // Default starting position
+		windowY: 100.0,
+		isVisible: true, // Start visible
+	}
+	
+	if err := ebiten.RunGame(game); err != nil {
 		log.Fatal(err)
 	}
 }
