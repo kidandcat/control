@@ -1,4 +1,4 @@
-module control
+module github.com/kidandcat/control
 
 go 1.24.1
 
